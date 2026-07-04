@@ -1,0 +1,193 @@
+name: Build fogorow PixelOS GSI (slim, Android 15)
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_repo:
+        description: "Fork with the device patches/makefiles"
+        required: true
+        default: "fuckyoumotorola/device_motorola_fogorow-pixel-gsi"
+      device_branch:
+        description: "Branch of device_repo to use (kept as android-14, that's just the branch name in this fork)"
+        required: true
+        default: "android-14"
+      manifest_branch:
+        description: "PixelOS-AOSP/manifest branch (this is what actually selects Android 15)"
+        required: true
+        default: "fifteen"
+      treble_manifest_branch:
+        description: "MisterZtr/treble_manifest branch matching manifest_branch. 15-2by2 = vanilla/no-gapps (closest to the old '14' branch). 15-los = adds MindTheGapps + LineageOS extras."
+        required: true
+        default: "15-2by2"
+      lunch_release_tag:
+        description: "Release-config field in the lunch combo (product-<release>-variant). ap2a matched the working Android 14 recipe; change only if lunch fails on Android 15."
+        required: true
+        default: "ap2a"
+      build_variant:
+        description: "userdebug or user"
+        required: true
+        default: "userdebug"
+      split_size_mb:
+        description: "Size of each split chunk uploaded to the Release, in MB (GitHub caps a single release asset at ~2GB)"
+        required: true
+        default: "1900"
+
+concurrency:
+  group: build-fogorow-gsi-slim
+  cancel-in-progress: true
+
+env:
+  ROM_DIR: /mnt/build/PixelOS
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Free up disk space
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 4096
+          swap-size-mb: 4096
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+          build-mount-path: "/mnt/build"
+
+      - name: Prepare build directory
+        run: |
+          sudo mkdir -p "$ROM_DIR"
+          sudo chown -R "$USER":"$USER" /mnt/build
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git-core gnupg flex bison build-essential zip curl \
+            zlib1g-dev libc6-dev-i386 lib32ncurses5-dev x11proto-core-dev \
+            libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc \
+            unzip fontconfig rsync bc python-is-python3 p7zip-full
+
+      - name: Install repo tool
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > "$HOME/bin/repo"
+          chmod a+x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Configure git identity
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+          git config --global color.ui false
+
+      - name: Init source tree (PixelOS-AOSP, Android 15 manifest)
+        run: |
+          mkdir -p "$ROM_DIR"
+          cd "$ROM_DIR"
+          repo init -u https://github.com/PixelOS-AOSP/manifest.git \
+            -b "${{ inputs.manifest_branch }}" --git-lfs
+
+      - name: Add treble local manifest
+        run: |
+          cd "$ROM_DIR"
+          rm -rf .repo/local_manifests
+          git clone https://github.com/MisterZtr/treble_manifest.git .repo/local_manifests \
+            -b "${{ inputs.treble_manifest_branch }}"
+
+      - name: Repo sync
+        run: |
+          cd "$ROM_DIR"
+          repo sync --force-sync --optimized-fetch --no-tags --no-clone-bundle --prune -j"$(nproc --all)"
+          df -h
+
+      - name: Generate signing keys (no passphrase)
+        run: |
+          cd "$ROM_DIR"
+          subject='/C=US/ST=State/L=City/O=Android/OU=Android/CN=Android/emailAddress=email@example.com'
+          for x in releasekey platform shared media networkstack verity otakey testkey sdk_sandbox bluetooth nfc; do
+            ./development/tools/make_key vendor/aosp/signing/keys/$x "$subject" </dev/null
+          done
+
+      - name: Fetch device patches/makefiles from the fork
+        run: |
+          cd "$ROM_DIR"
+          rm -rf /tmp/device-src
+          git clone --depth=1 --branch "${{ inputs.device_branch }}" \
+            "https://github.com/${{ inputs.device_repo }}.git" /tmp/device-src
+
+      - name: Apply trebledroid + personal patches
+        run: |
+          cd "$ROM_DIR"
+          bash /tmp/device-src/patches/apply-patches.sh /tmp/device-src
+
+      - name: Install product makefiles (pixel flavor + slim variant)
+        run: |
+          cd "$ROM_DIR"
+          cp /tmp/device-src/pixel.mk device/phh/treble/pixel.mk
+          cp /tmp/device-src/treble_arm64_bN.mk device/phh/treble/treble_arm64_bN.mk
+          cp /tmp/device-src/treble_arm64_bN_slim.mk device/phh/treble/treble_arm64_bN_slim.mk
+          # This AndroidProducts.mk already contains the standard generate.sh output
+          # for the "pixel" flavor plus the two custom bN / bN_slim entries, so we
+          # install it directly instead of re-running generate.sh.
+          cp /tmp/device-src/AndroidProducts.mk device/phh/treble/AndroidProducts.mk
+
+      - name: Build slim system image
+        run: |
+          cd "$ROM_DIR"
+          . build/envsetup.sh
+          export USE_CCACHE=0
+          lunch "treble_arm64_bN_slim-${{ inputs.lunch_release_tag }}-${{ inputs.build_variant }}"
+          make systemimage -j"$(nproc --all)"
+          df -h
+
+      - name: Compress system image
+        id: compress
+        run: |
+          cd "$ROM_DIR/out/target/product/tdgsi_arm64_ab"
+          7z a -mx=6 system.img.7z system.img
+          ls -lh system.img.7z
+          echo "size=$(stat -c%s system.img.7z)" >> "$GITHUB_OUTPUT"
+
+      - name: Split archive into Release-sized chunks
+        run: |
+          cd "$ROM_DIR/out/target/product/tdgsi_arm64_ab"
+          split -b "${{ inputs.split_size_mb }}M" -d -a 3 --additional-suffix=.part \
+            system.img.7z system.img.7z.
+          sha256sum system.img.7z.*.part > SHA256SUMS.txt
+          sha256sum system.img.7z >> SHA256SUMS.txt
+          ls -lh system.img.7z.*.part
+
+      - name: Set release tag
+        id: tag
+        run: |
+          echo "tag=fogorow-slim-a15-$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "fogorow slim GSI - Android 15 (${{ steps.tag.outputs.tag }})"
+          body: |
+            Automated build of the **slim** PixelOS GSI (`treble_arm64_bN_slim`) for Motorola fogorow, targeting Android 15.
+
+            - Device repo/branch: `${{ inputs.device_repo }}@${{ inputs.device_branch }}`
+            - Manifest branch: `${{ inputs.manifest_branch }}`
+            - Treble manifest branch: `${{ inputs.treble_manifest_branch }}`
+            - Lunch combo: `treble_arm64_bN_slim-${{ inputs.lunch_release_tag }}-${{ inputs.build_variant }}`
+            - Compressed image size: ${{ steps.compress.outputs.size }} bytes
+
+            The compressed image is split into parts because a single Release asset
+            is capped well under the archive's real size. To rebuild it locally:
+
+            ```bash
+            cat system.img.7z.*.part > system.img.7z
+            sha256sum -c SHA256SUMS.txt
+            7z x system.img.7z
+            ```
+          files: |
+            ${{ env.ROM_DIR }}/out/target/product/tdgsi_arm64_ab/system.img.7z.*.part
+            ${{ env.ROM_DIR }}/out/target/product/tdgsi_arm64_ab/SHA256SUMS.txt
