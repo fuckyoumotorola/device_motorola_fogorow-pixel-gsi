@@ -98,6 +98,10 @@ jobs:
           git clone https://github.com/MisterZtr/treble_manifest.git .repo/local_manifests \
             -b "${{ inputs.treble_manifest_branch }}"
 
+          # Remove duplicate project already present in PixelOS manifest
+          grep -rl 'external/selinux' .repo/local_manifests | \
+            xargs -r sed -i '/external\/selinux/d'
+
       - name: Repo sync
         run: |
           cd "$ROM_DIR"
